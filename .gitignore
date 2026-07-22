@@ -1,0 +1,3 @@
+target/
+Cargo.lock
+timsim-chem/xcheck/

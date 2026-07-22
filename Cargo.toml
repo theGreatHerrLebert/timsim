@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "timsim-types",
+    "timsim-schema",
+    "timsim-chem",
+    "timsim-core",
+]
+resolver = "2"
+
+# The foundation crates (ms-chem, mscore) are published on crates.io; ms-io 0.2.0 is not yet published,
+# so timsim-core deps it by path to the sibling foundation checkout. For local dev, patch the published
+# foundation crates back to that same checkout so the whole graph builds against one local foundation.
+[patch.crates-io]
+ms-chem = { path = "../mscore/ms-chem" }
+mscore = { path = "../mscore/mscore" }
