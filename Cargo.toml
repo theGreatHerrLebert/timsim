@@ -13,3 +13,7 @@ resolver = "2"
 [patch.crates-io]
 ms-chem = { path = "../mscore/ms-chem" }
 mscore = { path = "../mscore/mscore" }
+# timsim-core now deps ms-io + timsim-types by version (published); patch them to the local working tree
+# so edits here still build without a republish.
+ms-io = { path = "../mscore/ms-io" }
+timsim-types = { path = "timsim-types" }

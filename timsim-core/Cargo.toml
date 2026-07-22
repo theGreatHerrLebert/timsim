@@ -8,11 +8,10 @@ description = "The timsim v2 simulation engine: feature-space assembly, projecti
 repository = "https://github.com/theGreatHerrLebert/timsim"
 
 [dependencies]
-# The TDF I/O layer: reads a real .d's metadata (data::meta) + writes frames (data::tdf_writer). During
-# the R4 bootstrap this is a local path to the foundation checkout; flips to `= "0.2.0"` + [patch] on publish.
-ms-io = { path = "../../mscore/ms-io" }
+# The TDF I/O layer: reads a real .d's metadata (data::meta) + writes frames (data::tdf_writer).
+ms-io = "0.2.0"
 # Zero-dep leaf holding the acquisition-scheme contract types (re-exported via crate::scheme).
-timsim-types = { path = "../timsim-types" }
+timsim-types = "0.1.0"
 # Core MS data structures (peptides, spectra) the engine builds on.
 mscore = { version = "0.5.0" }
 # Synthetics DB read + analysis.tdf SQLite write.
