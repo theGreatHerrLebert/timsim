@@ -2,7 +2,9 @@
 
 Publishing is **irreversible** (crates.io versions are permanent). Each step below needs David's explicit
 go. Dry-run status current as of the R4 lining-up pass. Names verified free: `timsim-types`,
-`timsim-schema`, `timsim-chem`, `timsim-core`; `ms-io` has only `0.1.0` published (0.2.0 open).
+`timsim-schema`, `timsim-chem`, `timsim-core`. **All steps below are now done**: `ms-io 0.2.0` and
+all four `timsim-*` crates are live on crates.io, so this file is a record of how the release ran,
+not an open checklist.
 
 ## Order (a crate can't publish before its deps are on crates.io)
 

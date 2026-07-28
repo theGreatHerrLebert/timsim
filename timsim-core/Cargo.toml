@@ -11,7 +11,10 @@ repository = "https://github.com/theGreatHerrLebert/timsim"
 # The TDF I/O layer: reads a real .d's metadata (data::meta) + writes frames (data::tdf_writer).
 ms-io = "0.2.0"
 # Zero-dep leaf holding the acquisition-scheme contract types (re-exported via crate::scheme).
-timsim-types = "0.1.0"
+# `path` + `version`, not version alone: the path binds this to the workspace member, so edits to
+# timsim-types/src are picked up here and cargo does not resolve a *second* copy from the registry
+# alongside the member. `cargo publish` strips the path and keeps the version constraint.
+timsim-types = { path = "../timsim-types", version = "0.1.0" }
 # Core MS data structures (peptides, spectra) the engine builds on.
 mscore = { version = "0.5.0" }
 # Synthetics DB read + analysis.tdf SQLite write.
