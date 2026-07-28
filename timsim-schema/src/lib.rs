@@ -12,8 +12,10 @@
 //!
 //! Moving to Parquet does not fix that. Two things do, and only these:
 //!
-//! 1. **One schema definition** ([`tables`]) that both languages read. A column name is
-//!    never a string literal in stage code.
+//! 1. **One schema definition** ([`tables`]). A column name is never a string literal in
+//!    stage code. This crate is the Rust half of that contract — the Python stages (the deep
+//!    predictors `timsim-rt` / `timsim-ccs`) read the same column names through their own
+//!    reader, which lives in a separate repository. There is no Python in this workspace.
 //! 2. **Validate on read, at every stage boundary** ([`read`]). A tool asserts its input
 //!    conforms *before* it computes — so the explosion happens at the stage with the wrong
 //!    input, with a column-level message, rather than three stages later inside a `row.get()`.

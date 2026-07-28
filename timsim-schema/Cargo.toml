@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.84"
 license = "MIT"
 repository = "https://github.com/theGreatHerrLebert/timsim"
-description = "The schema contract for timsim v2. One definition of every column, read by Rust and Python alike."
+description = "The schema contract for timsim v2: one definition of every column, plus read-side validation at every stage boundary."
 
 [dependencies]
 arrow = "56"

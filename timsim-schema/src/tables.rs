@@ -10,7 +10,9 @@
 //! > (`simulator.py:1540`), and it has now spread into raw SQL in the published benchmark
 //! > repo (`MBRBenchmark.py:845`).
 //!
-//! Parquet does not fix that. One definition, read by both languages, does.
+//! Parquet does not fix that. One definition does. This module is that definition for every
+//! Rust stage; the Python stages read the same column names via a reader in a separate
+//! repository (no Python ships from this workspace).
 
 use crate::{Axis, TableSpec};
 use arrow::datatypes::{DataType, Field, Fields, Schema};

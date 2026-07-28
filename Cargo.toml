@@ -7,13 +7,17 @@ members = [
 ]
 resolver = "2"
 
-# The foundation crates (ms-chem, mscore) are published on crates.io; ms-io 0.2.0 is not yet published,
-# so timsim-core deps it by path to the sibling foundation checkout. For local dev, patch the published
-# foundation crates back to that same checkout so the whole graph builds against one local foundation.
-[patch.crates-io]
-ms-chem = { path = "../mscore/ms-chem" }
-mscore = { path = "../mscore/mscore" }
-# timsim-core now deps ms-io + timsim-types by version (published); patch them to the local working tree
-# so edits here still build without a republish.
-ms-io = { path = "../mscore/ms-io" }
-timsim-types = { path = "timsim-types" }
+# NO `[patch.crates-io]` here, deliberately.
+#
+# Every foundation crate this workspace depends on (ms-chem, mscore, ms-io) and every crate it
+# publishes (timsim-types, timsim-schema, timsim-chem, timsim-core) is live on crates.io, so a
+# plain `git clone && cargo build` resolves from the registry with no sibling checkouts.
+#
+# A committed `[patch.crates-io]` pointing at `../mscore/*` would make that clone FAIL for anyone
+# who does not happen to have the foundation repo checked out next to this one — the patch is a
+# local-development convenience, not a build requirement, and a convenience must never be a
+# precondition.
+#
+# Working on the foundation crates and this workspace at the same time? Put the patch in a
+# git-ignored `.cargo/config.toml` at the repo root (cargo honours `[patch]` there exactly as it
+# does in a manifest). See README.md -> "Local development against the foundation crates".

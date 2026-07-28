@@ -1,3 +1,6 @@
 target/
 Cargo.lock
 timsim-chem/xcheck/
+# Local-only cargo overrides — the [patch.crates-io] that points the foundation crates at a
+# sibling checkout lives here, never in the committed manifest. See README.md.
+.cargo/
