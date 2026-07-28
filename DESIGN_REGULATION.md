@@ -1,5 +1,29 @@
 # Plan — per-protein regulation: honour the request, and let magnitudes vary
 
+> **STATUS: IMPLEMENTED** (timsim-chem 0.2.0 / timsim-schema 0.2.0 / timsim-cli).
+> Gaps 1, 2 and 3 are closed, and every unit assertion in the Validation section below is a test
+> in `timsim-chem/src/design.rs`. Summary of what shipped:
+>
+> * `Regulation::Explicit { proteins: BTreeMap<String, f64> }` — per-protein magnitudes;
+>   `Condition.regulate` is a `Vec<Regulation>`. TOML: a list of `kind`-tagged blocks; the scalar
+>   `{ proteins = [...], log2fc = … }` still parses and warns. Duplicate accessions across blocks
+>   and two generative blocks in one condition are errors; explicit beats generative, order-free.
+> * Explicit accessions are **forced present** (union over all conditions, so both arms of a
+>   contrast have them) and displace the lowest-ranked non-regulated proteins, so the count stays
+>   exactly `n_proteins`. Doesn't fit ⇒ error naming the minimum that does.
+> * `protein_quantities` gains `requested_log2fc` (authored); `true_log2fc` keeps its realised
+>   meaning. Schema 2.0 → 2.1 (additive).
+> * `timsim-yield` counts surviving peptides per regulated protein, warns on zero, and writes a
+>   `[regulated_peptides]` table into `--report`. The digest sample stays uniform.
+> * Bonus, found while verifying "identical output": the per-sample load rescale summed a
+>   `HashMap`, whose order is seeded per process — two runs of one spec differed in the last bits.
+>   Now summed in Vec order, and asserted bit-identical.
+>
+> One deviation, argued in the test itself: *seed stability* is asserted as **membership unchanged
+> + a single common rescale within the affected organism + no change at all elsewhere**, not as
+> unchanged absolute `amount_amol`. The load is fixed, so swapping one protein for another must
+> move mass between them; what must not change — and does not — is any *relative* abundance.
+
 Two defects in `timsim-chem`'s design axis, found by running a real PhantomBENCH cohort through v2
 (`design.rs`; spec deserialisation in `timsim-cli/src/spec.rs`). Both concern `[[condition]].regulate`,
 which is otherwise wired end-to-end and already emits `true_log2fc` per condition as the answer key.

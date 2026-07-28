@@ -19,7 +19,7 @@ use arrow::datatypes::{DataType, Field, Fields, Schema};
 use std::sync::Arc;
 
 /// Schema version. Bump the **major** on any breaking change; readers reject a mismatch.
-pub const SCHEMA_VERSION: &str = "2.0";
+pub const SCHEMA_VERSION: &str = "2.1";
 
 fn spec(name: &'static str, axis: Axis, fields: Vec<Field>) -> TableSpec {
     TableSpec {
@@ -680,6 +680,7 @@ pub mod protein_quantities {
     pub const SAMPLE_ID: &str = "sample_id";
     pub const AMOUNT_AMOL: &str = "amount_amol";
     pub const TRUE_LOG2FC: &str = "true_log2fc";
+    pub const REQUESTED_LOG2FC: &str = "requested_log2fc";
     pub const IS_REGULATED: &str = "is_regulated";
 
     /// The quantitative answer key.
@@ -693,9 +694,15 @@ pub mod protein_quantities {
     /// becomes ion flux, then counts, then ADC values — each a transfer function, not a
     /// multiplication. Nothing past the source is called `amol`.
     ///
-    /// `true_log2fc` is computed from **final** amounts against the reference condition, so a
-    /// large spike-in's compositional dilution of the background is *recorded* rather than
-    /// pretended away.
+    /// `true_log2fc` is the **realised** ratio, computed from **final** amounts against the
+    /// reference condition, so a large spike-in's compositional dilution of the background is
+    /// *recorded* rather than pretended away. It is what a DE analysis can actually recover.
+    ///
+    /// `requested_log2fc` is the **authored** intervention for this sample's condition — the
+    /// number that was typed into `regulate` — and is null for an unregulated protein. The two
+    /// must be kept apart: applying a fold change and then renormalising to a fixed load moves
+    /// every protein, so a requested +1.0 realises as ~+0.94, and with per-protein magnitudes
+    /// that distortion differs per protein.
     pub fn spec() -> TableSpec {
         super::spec(
             TABLE,
@@ -705,6 +712,7 @@ pub mod protein_quantities {
                 Field::new(SAMPLE_ID, DataType::Utf8, false),
                 Field::new(AMOUNT_AMOL, DataType::Float64, false),
                 Field::new(TRUE_LOG2FC, DataType::Float32, true),
+                Field::new(REQUESTED_LOG2FC, DataType::Float32, true),
                 Field::new(IS_REGULATED, DataType::Boolean, false),
             ],
         )

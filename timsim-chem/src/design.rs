@@ -22,6 +22,28 @@
 //! reason `Sample` and `Run` are separate entities, and conflating them is what makes
 //! TMT (N samples → 1 run) unrepresentable.
 //!
+//! # Regulated ⇒ present
+//!
+//! Naming a protein in an explicit `regulate` block is a statement that the experiment is
+//! **about** it, so it is forced into the sample regardless of `n_proteins` — and the
+//! lowest-ranked non-regulated proteins are displaced to make room, because `n_proteins` is
+//! sample complexity, not a floor. The final count is exactly what was asked for.
+//!
+//! This exists because the two guarantees used to sit one stage apart: a *stale* accession was a
+//! hard error, but a *valid* accession that the presence rank happened not to select was silently
+//! dropped. Measured on a real benchmark: 14 named proteins, 10 dropped, no warning — and a DE
+//! analysis over the result under-recovers the planted signature in a way indistinguishable from
+//! poor tool performance. If the regulated set cannot fit, that is an error naming the minimum
+//! `n_proteins` that would.
+//!
+//! # Requested is not realised
+//!
+//! Applying a fold change and then renormalising to a fixed load moves **every** protein,
+//! including the unregulated ones. So the answer key carries both numbers: `true_log2fc` is the
+//! realised ratio (what a DE analysis can recover) and `requested_log2fc` is what was authored
+//! (what the spec says). Conflating them scores a benchmark against a value nothing in the sample
+//! actually has.
+//!
 //! # Mass balance
 //!
 //! ```text
@@ -91,12 +113,41 @@ fn hockey_stick(rank01: f64, decay: f64, tail: f64) -> f64 {
 }
 
 /// Regulation of individual proteins, on top of (or instead of) an organism mixture.
+///
+/// A condition carries a **list** of these. `Explicit` blocks compose (their maps are unioned,
+/// and a protein named twice is an error, not a last-writer-wins accident); at most one
+/// `Generative` block is allowed per condition, because two random draws over the same protein
+/// set have no defined composition.
 #[derive(Clone, Debug)]
 pub enum Regulation {
-    /// A named set moved by a known amount — for reproducing a published benchmark.
-    Explicit { proteins: Vec<String>, log2fc: f64 },
+    /// A named set, **each protein with its own log2 fold change** — for reproducing a published
+    /// benchmark, where the authored magnitudes differ per protein and collapsing them to one
+    /// number makes a volcano rank the planted set by noise instead of by effect size.
+    ///
+    /// Naming a protein here is a statement that the experiment is *about* it, so it is forced
+    /// into the present set regardless of [`Complexity::n_proteins`] — see [`resolve`].
+    Explicit { proteins: BTreeMap<String, f64> },
     /// A random fraction moved by a draw from `N(0, log2fc_sd)` — for power analysis.
+    ///
+    /// Defined over the **final** present set, and it forces nothing: explicit forcing happens
+    /// first, then presence is decided, then this draws over what is present.
     Generative { fraction: f64, log2fc_sd: f64 },
+}
+
+impl Regulation {
+    /// The **deprecated** scalar form: one magnitude for a whole named set.
+    ///
+    /// Kept because published configs are written this way. New specs should give each protein
+    /// its own magnitude — a real signature does not move every member by the same amount.
+    pub fn uniform<I, S>(proteins: I, log2fc: f64) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Regulation::Explicit {
+            proteins: proteins.into_iter().map(|p| (p.into(), log2fc)).collect(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -108,7 +159,8 @@ pub struct Condition {
     pub replicates: u32,
     /// Injections per biological replicate. Same material, so **same amounts**.
     pub technical_replicates: u32,
-    pub regulate: Option<Regulation>,
+    /// Zero or more regulation blocks, applied on top of the mixture. Empty ⇒ no regulation.
+    pub regulate: Vec<Regulation>,
 }
 
 /// How much each protein varies between biological replicates.
@@ -238,9 +290,20 @@ pub struct ProteinQuantity {
     pub protein_id: String,
     pub sample_id: String,
     pub amount_amol: f64,
-    /// Computed from **final** amounts against the reference condition, so it stays correct
-    /// even when regulation shifts the composition.
+    /// The **realised** between-condition ratio, computed from **final** amounts against the
+    /// reference condition — after regulation *and* after the load renormalisation. This is the
+    /// answer key: it is what a DE analysis can actually recover, and it stays correct when
+    /// regulation shifts the composition.
+    ///
+    /// It is deliberately **not** the number the user typed. Applying a fold change and then
+    /// renormalising to a fixed load moves every protein, including unregulated ones, so a
+    /// requested +1.0 realises as (say) +0.94 and the distortion differs per protein.
     pub true_log2fc: f64,
+    /// The **requested** intervention: the log2 fold change authored for *this condition*, or
+    /// `None` if this protein was not regulated here. Recorded so a run can be traced back to
+    /// its spec; against a regulated reference the requested contrast is
+    /// `requested(condition) − requested(reference)`.
+    pub requested_log2fc: Option<f64>,
     pub is_regulated: bool,
 }
 
@@ -271,6 +334,14 @@ pub struct DesignReport {
     /// Proteins skipped because they contain non-standard residues (`X`, `B`, `Z`, …). We
     /// cannot compute their mass, and guessing one would corrupt the mass balance silently.
     pub skipped_proteins: Vec<String>,
+    /// Explicitly regulated proteins that `n_proteins` would have excluded, and which were
+    /// **forced** into the sample instead. Naming a protein in `regulate` is a statement that
+    /// the experiment is about it; dropping it silently produced a confidently wrong benchmark.
+    pub forced_present: Vec<String>,
+    /// The lowest-ranked proteins pushed out of the sample to make room for `forced_present`,
+    /// so the final count is exactly `n_proteins`. Reported because a displacement is a change
+    /// to the sample the user did not type.
+    pub displaced: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -355,6 +426,21 @@ fn gauss(parts: &[&str], seed: u64) -> f64 {
     (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
 }
 
+/// Resolve a design into samples, runs, and the quantitative answer key.
+///
+/// # Order of operations (it is load-bearing)
+///
+/// 1. Explicit regulation is **validated** — every accession in every block, against the proteome.
+/// 2. Explicitly regulated proteins are **forced** into the present set; `n_proteins` then fills
+///    the remaining slots with the highest-ranked proteins that were not named, so the final
+///    count is exactly `n_proteins`. Forcing **displaces**; it does not expand.
+/// 3. Abundances are drawn — identity-keyed, so forcing a protein in does not reshuffle anyone
+///    else's rank.
+/// 4. `Generative` regulation draws over the **final** present set. It forces nothing, and it
+///    never overrides an explicit magnitude.
+/// 5. Amounts are renormalised to the declared load, and `true_log2fc` is computed from the
+///    **final** amounts — so the compositional dilution regulation causes is recorded rather
+///    than pretended away.
 pub fn resolve(spec: &DesignSpec, proteins: &[DesignProtein]) -> Result<Design, String> {
     // A zero, negative, NaN or infinite load divides by zero in the normalisation below and
     // writes NaN or negative attomole amounts into the answer key — without an error. There is
@@ -395,6 +481,122 @@ pub fn resolve(spec: &DesignSpec, proteins: &[DesignProtein]) -> Result<Design, 
         return Err("no proteins with computable mass".to_string());
     }
 
+    // Condition names key `shares`, `condition_amounts` and `regulated`, so a duplicate name
+    // would silently overwrite the first definition — while the sample loop, which iterates
+    // the *vector*, still emitted samples and runs for BOTH, attaching the overwritten
+    // amounts. Ambiguous artifacts, no error.
+    {
+        let mut seen = std::collections::HashSet::new();
+        for c in &spec.conditions {
+            if !seen.insert(c.name.as_str()) {
+                return Err(format!("duplicate condition name {:?}", c.name));
+            }
+            // A cardinality the user typed is a cardinality we must honour or refuse. Zero
+            // biological replicates silently produced no samples at all; zero technical
+            // replicates was silently rounded up to one by a `.max(1)`. Either way the artifacts
+            // disagree with the design that was asked for.
+            if c.replicates == 0 {
+                return Err(format!(
+                    "condition {:?}: replicates must be at least 1",
+                    c.name
+                ));
+            }
+            if c.technical_replicates == 0 {
+                return Err(format!(
+                    "condition {:?}: technical_replicates must be at least 1",
+                    c.name
+                ));
+            }
+        }
+    }
+
+    // ── regulation: validate FIRST, because presence now depends on it ────────
+    //
+    // Regulation is part of the answer key, so a typo in it must not silently produce a design
+    // with no regulation at all — and, one stage later, a *named* protein must not be silently
+    // dropped either. `regulate` was already validated against the proteome; it used to be
+    // *applied* only to whichever of those proteins the presence rank (which knows nothing about
+    // regulation) happened to pick. At `n_proteins = 2400` that silently dropped 10 of a
+    // benchmark's 14 regulated accessions: the answer key claimed a differential only 4 proteins
+    // carried, and the shortfall was indistinguishable from poor tool performance.
+    //
+    // So a protein named in an `Explicit` block is FORCED present (below). The forced set is the
+    // union over EVERY condition, because a fold change needs a baseline: a protein forced into
+    // the treatment arm but not into the reference has an undefined — infinite — `true_log2fc`.
+    let known: std::collections::HashSet<&str> = usable.iter().map(|p| p.id).collect();
+    // condition -> protein -> requested log2fc, and condition -> the single generative block.
+    let mut explicit_fc: BTreeMap<&str, BTreeMap<&str, f64>> = BTreeMap::new();
+    let mut generative: BTreeMap<&str, (f64, f64)> = BTreeMap::new();
+    let mut forced: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+
+    for c in &spec.conditions {
+        let mut per_condition: BTreeMap<&str, f64> = BTreeMap::new();
+        let mut n_generative = 0usize;
+        for r in &c.regulate {
+            match r {
+                Regulation::Explicit { proteins } => {
+                    for (id, fc) in proteins {
+                        // A fold change is a biological quantity, not an arbitrary float.
+                        // `log2fc = 1024` makes 2^fc infinite; the load normalisation then
+                        // computes an infinite total and writes NaN amounts (inf * 0) into the
+                        // answer key. Checked here, up front, so an unusable magnitude is refused
+                        // whether or not the protein turns out to be in the sample.
+                        if !fc.is_finite() || fc.abs() > MAX_ABS_LOG2FC {
+                            return Err(format!(
+                                "condition {:?}: log2 fold change for {id:?} must be finite and \
+                                 within ±{MAX_ABS_LOG2FC}, got {fc}",
+                                c.name
+                            ));
+                        }
+                        let canonical = known.get(id.as_str()).copied().ok_or_else(|| {
+                            format!(
+                                "condition {:?}: regulated protein {id:?} is not in the proteome \
+                                 — a stale accession would silently apply no regulation at all",
+                                c.name
+                            )
+                        })?;
+                        // Two blocks naming the same protein have no defined composition, and
+                        // resolving it by iteration order would make the answer key depend on the
+                        // order the blocks happen to be written in.
+                        if let Some(prev) = per_condition.insert(canonical, *fc) {
+                            return Err(format!(
+                                "condition {:?}: protein {id:?} appears in more than one explicit \
+                                 regulation block ({prev} and {fc}) — the composition of two \
+                                 magnitudes is undefined, so name it exactly once",
+                                c.name
+                            ));
+                        }
+                        forced.insert(canonical);
+                    }
+                }
+                Regulation::Generative { fraction, log2fc_sd } => {
+                    if !fraction.is_finite() || !(0.0..=1.0).contains(fraction) {
+                        return Err(format!(
+                            "condition {:?}: regulated fraction must be finite and in [0, 1], got {fraction}",
+                            c.name
+                        ));
+                    }
+                    if !log2fc_sd.is_finite() || *log2fc_sd < 0.0 {
+                        return Err(format!(
+                            "condition {:?}: log2fc_sd must be finite and non-negative, got {log2fc_sd}",
+                            c.name
+                        ));
+                    }
+                    n_generative += 1;
+                    if n_generative > 1 {
+                        return Err(format!(
+                            "condition {:?}: at most one generative regulation block is allowed — \
+                             two random draws over the same protein set have no defined composition",
+                            c.name
+                        ));
+                    }
+                    generative.insert(c.name.as_str(), (*fraction, *log2fc_sd));
+                }
+            }
+        }
+        explicit_fc.insert(c.name.as_str(), per_condition);
+    }
+
     // ── which proteins are actually IN the sample ─────────────────────────────
     //
     // Subsetting is a quantity operation. Excluded proteins stay in the structure and receive
@@ -410,6 +612,9 @@ pub fn resolve(spec: &DesignSpec, proteins: &[DesignProtein]) -> Result<Design, 
     for p in &usable {
         org_members.entry(p.organism).or_default().push(p);
     }
+
+    let mut forced_present: Vec<String> = Vec::new();
+    let mut displaced: Vec<String> = Vec::new();
 
     let present: std::collections::HashSet<&str> = match spec.complexity.n_proteins {
         None => usable.iter().map(|p| p.id).collect(),
@@ -433,51 +638,119 @@ pub fn resolve(spec: &DesignSpec, proteins: &[DesignProtein]) -> Result<Design, 
                 ));
             }
 
-            // Allocate proportionally to organism size, at least one each, summing to exactly n.
+            // Every organism needs at least one protein; an organism holding forced (explicitly
+            // regulated) proteins needs at least all of them. So the smallest workable
+            // `n_proteins` is the sum of those floors — and we say which number that is rather
+            // than making the user bisect for it.
+            let floor_for = |org: &str| -> usize {
+                let f = org_members[org]
+                    .iter()
+                    .filter(|p| forced.contains(p.id))
+                    .count();
+                f.max(1)
+            };
+            let min_n: usize = org_members.keys().map(|org| floor_for(org)).sum();
+            if n < min_n {
+                return Err(format!(
+                    "complexity.n_proteins ({n}) is below the {min_n} proteins this design must \
+                     contain: {} are named in an explicit `regulate` block, and naming a protein \
+                     there is a statement that the experiment is about it — so it is forced into \
+                     the sample rather than silently dropped. Set complexity.n_proteins to at \
+                     least {min_n}, or regulate fewer proteins",
+                    forced.len()
+                ));
+            }
+
+            // Allocate proportionally to organism size, at least its floor, summing to exactly n.
             let total = usable.len() as f64;
             let mut alloc: Vec<(&str, usize)> = org_members
                 .iter()
                 .map(|(org, m)| {
                     let want = (n as f64 * m.len() as f64 / total).round() as usize;
-                    (*org, want.max(1).min(m.len()))
+                    (*org, want.max(floor_for(org)).min(m.len()))
                 })
                 .collect();
 
-            // Reconcile rounding against the requested total.
+            // Reconcile rounding against the requested total. The loop stops when a full pass
+            // over the organisms changes nothing, so it terminates without an iteration cap —
+            // and because `min_n <= n <= usable.len()`, an exact allocation is always reachable.
             let n_orgs = alloc.len();
             let caps: Vec<usize> = alloc.iter().map(|(org, _)| org_members[*org].len()).collect();
+            let floors: Vec<usize> = alloc.iter().map(|(org, _)| floor_for(org)).collect();
             let mut got: usize = alloc.iter().map(|(_, k)| *k).sum();
-            let mut idx = 0usize;
-            while got != n && n_orgs > 0 {
-                let i = idx % n_orgs;
-                let k = &mut alloc[i].1;
-                if got < n && *k < caps[i] {
-                    *k += 1;
-                    got += 1;
-                } else if got > n && *k > 1 {
-                    *k -= 1;
-                    got -= 1;
+            while got != n {
+                let mut progress = false;
+                for i in 0..n_orgs {
+                    if got == n {
+                        break;
+                    }
+                    let k = &mut alloc[i].1;
+                    if got < n && *k < caps[i] {
+                        *k += 1;
+                        got += 1;
+                        progress = true;
+                    } else if got > n && *k > floors[i] {
+                        *k -= 1;
+                        got -= 1;
+                        progress = true;
+                    }
                 }
-                idx += 1;
-                if idx > 16 * n_orgs {
-                    break; // every organism is capped; take what we can reach
+                if !progress {
+                    break;
                 }
+            }
+            if got != n {
+                return Err(format!(
+                    "could not select exactly {n} proteins (reached {got}) — this is a bug in the \
+                     complexity allocation"
+                ));
             }
 
             let mut chosen = std::collections::HashSet::new();
             for (org, k) in alloc {
                 // Identity-keyed within the organism: raising n yields a SUPERSET, and adding a
                 // protein to the FASTA does not reshuffle which of the others were selected.
+                // The rank is a property of the protein alone, so it is unaffected by which
+                // *other* proteins are forced in — forcing displaces, it does not reshuffle.
                 let mut ranked: Vec<(u64, &str)> = org_members[org]
                     .iter()
                     .map(|p| (stable_hash(&["present", p.id], spec.seed), p.id))
                     .collect();
                 ranked.sort_unstable();
-                chosen.extend(ranked.into_iter().take(k).map(|(_, id)| id));
+
+                // What rank alone would have selected — kept only to *report* the displacement.
+                let baseline: std::collections::HashSet<&str> =
+                    ranked.iter().take(k).map(|(_, id)| *id).collect();
+
+                // FORCE + DISPLACE, not expand. `n_proteins` is sample complexity, not a floor:
+                // the named proteins go in, and the remaining slots go to the highest-ranked
+                // proteins that were NOT named. The final count is exactly `n_proteins`.
+                let forced_here: Vec<&str> = ranked
+                    .iter()
+                    .map(|(_, id)| *id)
+                    .filter(|id| forced.contains(id))
+                    .collect();
+                for id in &forced_here {
+                    chosen.insert(*id);
+                    if !baseline.contains(id) {
+                        forced_present.push((*id).to_string());
+                    }
+                }
+                let slots = k - forced_here.len();
+                for (_, id) in ranked.iter().filter(|(_, id)| !forced.contains(id)).take(slots) {
+                    chosen.insert(*id);
+                }
+                for id in baseline {
+                    if !chosen.contains(id) {
+                        displaced.push(id.to_string());
+                    }
+                }
             }
             chosen
         }
     };
+    forced_present.sort();
+    displaced.sort();
 
     // ── within-organism molar abundance, normalised over the PRESENT proteins ─
     //
@@ -551,76 +824,22 @@ pub fn resolve(spec: &DesignSpec, proteins: &[DesignProtein]) -> Result<Design, 
         mean_mw.insert((*org).to_string(), m);
     }
 
+    // Forcing a protein into the sample is pointless if its abundance profile gives it zero
+    // material: it would carry amount 0, `is_regulated` would be false (a zero cannot be
+    // regulated), and the named intervention would vanish again — the exact silent drop this
+    // forcing exists to prevent, one layer down. A `Table` profile missing the accession is the
+    // way that happens in practice.
+    for id in &forced {
+        if molar_fraction.get(id).copied().unwrap_or(0.0) <= 0.0 {
+            return Err(format!(
+                "regulated protein {id:?} has zero abundance under its organism's abundance \
+                 profile, so it would carry no material and the regulation would silently vanish \
+                 — give it an abundance (a `table` profile must list it) or stop regulating it"
+            ));
+        }
+    }
+
     // ── resolve mass shares per condition ─────────────────────────────────────
-    //
-    // Condition names key `shares`, `condition_amounts` and `regulated`, so a duplicate name
-    // would silently overwrite the first definition — while the sample loop, which iterates
-    // the *vector*, still emitted samples and runs for BOTH, attaching the overwritten
-    // amounts. Ambiguous artifacts, no error.
-    {
-        let mut seen = std::collections::HashSet::new();
-        for c in &spec.conditions {
-            if !seen.insert(c.name.as_str()) {
-                return Err(format!("duplicate condition name {:?}", c.name));
-            }
-            // A cardinality the user typed is a cardinality we must honour or refuse. Zero
-            // biological replicates silently produced no samples at all; zero technical
-            // replicates was silently rounded up to one by a `.max(1)`. Either way the artifacts
-            // disagree with the design that was asked for.
-            if c.replicates == 0 {
-                return Err(format!(
-                    "condition {:?}: replicates must be at least 1",
-                    c.name
-                ));
-            }
-            if c.technical_replicates == 0 {
-                return Err(format!(
-                    "condition {:?}: technical_replicates must be at least 1",
-                    c.name
-                ));
-            }
-        }
-    }
-
-    // Regulation is part of the answer key, so a typo in it must not silently produce a design
-    // with no regulation at all.
-    {
-        let known: std::collections::HashSet<&str> = usable.iter().map(|p| p.id).collect();
-        for c in &spec.conditions {
-            match &c.regulate {
-                Some(Regulation::Explicit { proteins, log2fc }) => {
-                    if !log2fc.is_finite() {
-                        return Err(format!("condition {:?}: log2fc must be finite", c.name));
-                    }
-                    for id in proteins {
-                        if !known.contains(id.as_str()) {
-                            return Err(format!(
-                                "condition {:?}: regulated protein {id:?} is not in the proteome \
-                                 — a stale accession would silently apply no regulation at all",
-                                c.name
-                            ));
-                        }
-                    }
-                }
-                Some(Regulation::Generative { fraction, log2fc_sd }) => {
-                    if !fraction.is_finite() || !(0.0..=1.0).contains(fraction) {
-                        return Err(format!(
-                            "condition {:?}: regulated fraction must be finite and in [0, 1], got {fraction}",
-                            c.name
-                        ));
-                    }
-                    if !log2fc_sd.is_finite() || *log2fc_sd < 0.0 {
-                        return Err(format!(
-                            "condition {:?}: log2fc_sd must be finite and non-negative, got {log2fc_sd}",
-                            c.name
-                        ));
-                    }
-                }
-                None => {}
-            }
-        }
-    }
-
     let organisms: Vec<String> = by_organism.keys().map(|o| o.to_string()).collect();
     let mut shares: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
     for c in &spec.conditions {
@@ -686,17 +905,18 @@ pub fn resolve(spec: &DesignSpec, proteins: &[DesignProtein]) -> Result<Design, 
     //
     // amount_i = total_amol(org) · f_i,  where  total_amol(org) = mass_ng(org) · 1e9 / <M>_org
     let mut condition_amounts: BTreeMap<String, HashMap<&str, f64>> = BTreeMap::new();
-    let mut regulated: BTreeMap<String, HashMap<&str, bool>> = BTreeMap::new();
+    // protein -> the log2fc the user REQUESTED for it in this condition. `None` (absent) means
+    // unregulated; `is_regulated` is derived from it, so the flag and the magnitude cannot drift.
+    let mut regulated: BTreeMap<String, HashMap<&str, f64>> = BTreeMap::new();
 
     for c in &spec.conditions {
         // Every usable protein appears in the answer key. Absent ones carry amount 0 — which is what
         // makes a search engine's hit on them a nameable false positive, and protein FDR answerable.
         let mut amounts: HashMap<&str, f64> = HashMap::new();
-        let mut reg: HashMap<&str, bool> = HashMap::new();
+        let mut reg: HashMap<&str, f64> = HashMap::new();
         for p in &usable {
             if !present.contains(p.id) {
                 amounts.insert(p.id, 0.0);
-                reg.insert(p.id, false);
             }
         }
 
@@ -713,38 +933,34 @@ pub fn resolve(spec: &DesignSpec, proteins: &[DesignProtein]) -> Result<Design, 
                     0.0
                 };
                 amounts.insert(p.id, amt);
-                reg.insert(p.id, false);
             }
         }
 
         // Regulation on top of the mixture.
-        if let Some(r) = &c.regulate {
+        //
+        // PRECEDENCE, fixed and tested: an `Explicit` entry always wins over a `Generative` draw
+        // for the same protein. A generative rule is a statement about the *background*; when the
+        // user has also named a protein, the named magnitude is the one they meant. Resolving the
+        // overlap by block order instead would make the answer key depend on how the TOML happens
+        // to be written.
+        let explicit_here = &explicit_fc[c.name.as_str()];
+        if !explicit_here.is_empty() || generative.contains_key(c.name.as_str()) {
             for p in &usable {
-                let fc = match r {
-                    Regulation::Explicit { proteins, log2fc } => {
-                        if proteins.iter().any(|x| x == p.id) {
-                            Some(*log2fc)
-                        } else {
-                            None
-                        }
-                    }
-                    Regulation::Generative {
-                        fraction,
-                        log2fc_sd,
-                    } => {
+                let fc = match explicit_here.get(p.id) {
+                    Some(fc) => Some(*fc),
+                    None => generative.get(c.name.as_str()).and_then(|(fraction, sd)| {
                         let u = (stable_hash(&["regulate", p.id], spec.seed) >> 11) as f64
                             / (1u64 << 53) as f64;
                         if u < *fraction {
-                            Some(log2fc_sd * gauss(&["regulate_fc", p.id, &c.name], spec.seed))
+                            Some(sd * gauss(&["regulate_fc", p.id, &c.name], spec.seed))
                         } else {
                             None
                         }
-                    }
+                    }),
                 };
                 if let Some(fc) = fc {
-                    // `log2fc = 1024` makes 2^fc infinite; the load normalisation then computes an
-                    // infinite total and writes NaN amounts (inf * 0) into the answer key. A fold
-                    // change is a biological quantity, not an arbitrary float.
+                    // Explicit magnitudes were bounds-checked up front; a generative draw is
+                    // `sd * z` and can in principle exceed the bound, so it is checked here too.
                     if !fc.is_finite() || fc.abs() > MAX_ABS_LOG2FC {
                         return Err(format!(
                             "condition {:?}: log2 fold change for {:?} must be finite and within \
@@ -757,10 +973,12 @@ pub fn resolve(spec: &DesignSpec, proteins: &[DesignProtein]) -> Result<Design, 
                     // stay in the answer key — so a bare `get_mut` is not enough: multiplying 0 by a
                     // fold change is still 0, and flagging it `is_regulated` would make the ground
                     // truth claim a molecule was regulated when it is not in the sample at all.
+                    // Explicitly regulated proteins are forced present, so this now only skips
+                    // generative draws that landed on an absent protein.
                     if let Some(a) = amounts.get_mut(p.id) {
                         if *a > 0.0 {
                             *a *= 2f64.powf(fc);
-                            reg.insert(p.id, true);
+                            reg.insert(p.id, fc);
                         }
                     }
                 }
@@ -771,9 +989,14 @@ pub fn resolve(spec: &DesignSpec, proteins: &[DesignProtein]) -> Result<Design, 
         // 200 ng whatever the composition — and it is why `true_log2fc` must be computed
         // from FINAL amounts: a large spike-in compositionally dilutes everything else, and
         // that dilution is real and must appear in the answer key.
-        let total_ng: f64 = amounts
+        // Summed over `usable` — a Vec — and NOT over the `amounts` HashMap. A HashMap iterates
+        // in an order that depends on a per-process random seed, so summing over it made the
+        // total, hence the load rescale, hence every amount in the answer key, differ in the last
+        // bits between two runs of the identical design. A reproducibility guarantee that holds
+        // only to 1e-16 is not a guarantee, and it makes byte-comparing two artifacts impossible.
+        let total_ng: f64 = usable
             .iter()
-            .map(|(id, a)| mass::amol_to_ng(*a, mw[*id]))
+            .map(|p| mass::amol_to_ng(amounts[p.id], mw[p.id]))
             .sum();
         if !total_ng.is_finite() || total_ng <= 0.0 {
             return Err(format!(
@@ -851,18 +1074,19 @@ pub fn resolve(spec: &DesignSpec, proteins: &[DesignProtein]) -> Result<Design, 
             }
 
             // Variance perturbs composition, so restore the load. Mass balance is exact.
-            let total_ng: f64 = amounts
+            // Vec order, not HashMap order — see the note on the per-condition total above.
+            let total_ng: f64 = usable
                 .iter()
-                .map(|(id, a)| mass::amol_to_ng(*a, mw[*id]))
+                .map(|p| mass::amol_to_ng(amounts[p.id], mw[p.id]))
                 .sum();
             let scale = spec.load_ng / total_ng;
             for a in amounts.values_mut() {
                 *a *= scale;
             }
 
-            let check_ng: f64 = amounts
+            let check_ng: f64 = usable
                 .iter()
-                .map(|(id, a)| mass::amol_to_ng(*a, mw[*id]))
+                .map(|p| mass::amol_to_ng(amounts[p.id], mw[p.id]))
                 .sum();
             worst_error = worst_error.max((check_ng - spec.load_ng).abs());
 
@@ -880,7 +1104,8 @@ pub fn resolve(spec: &DesignSpec, proteins: &[DesignProtein]) -> Result<Design, 
                     } else {
                         f64::NAN
                     },
-                    is_regulated: regulated[&c.name][p.id],
+                    requested_log2fc: regulated[&c.name].get(p.id).copied(),
+                    is_regulated: regulated[&c.name].contains_key(p.id),
                 });
             }
 
@@ -945,6 +1170,8 @@ pub fn resolve(spec: &DesignSpec, proteins: &[DesignProtein]) -> Result<Design, 
             load_ng: spec.load_ng,
             mass_balance_error_ng: worst_error,
             skipped_proteins: skipped,
+            forced_present,
+            displaced,
         },
     })
 }
@@ -997,7 +1224,7 @@ mod tests {
                     .into(),
                     replicates: 3,
                     technical_replicates: 2,
-                    regulate: None,
+                    regulate: Vec::new(),
                 },
                 Condition {
                     name: "B".into(),
@@ -1009,7 +1236,7 @@ mod tests {
                     .into(),
                     replicates: 3,
                     technical_replicates: 2,
-                    regulate: None,
+                    regulate: Vec::new(),
                 },
             ],
         }
@@ -1157,10 +1384,10 @@ mod tests {
     fn regulation_dilutes_the_background_and_the_truth_records_it() {
         let ps = hye_proteins();
         let mut s = spec(200.0, 0.0);
-        s.conditions[1].regulate = Some(Regulation::Explicit {
-            proteins: (0..20).map(|i| format!("HUM{i}")).collect(),
-            log2fc: 3.0, // 8× on half the human proteome — a big compositional shift
-        });
+        s.conditions[1].regulate = vec![Regulation::uniform(
+            (0..20).map(|i| format!("HUM{i}")),
+            3.0, // 8× on half the human proteome — a big compositional shift
+        )];
         let d = run(&s, &ps);
 
         let fc = |p: &str| {
@@ -1396,18 +1623,12 @@ mod tests {
             .collect();
         for bad in [1024.0, f64::INFINITY, f64::NAN, -1024.0] {
             let mut s = spec(200.0, 0.0);
-            s.conditions[1].regulate = Some(Regulation::Explicit {
-                proteins: vec!["HUM0".into()],
-                log2fc: bad,
-            });
+            s.conditions[1].regulate = vec![Regulation::uniform(["HUM0"], bad)];
             assert!(resolve(&s, &dp).is_err(), "log2fc = {bad} must be rejected");
         }
         // A real fold change still works, and the amounts stay finite.
         let mut s = spec(200.0, 0.0);
-        s.conditions[1].regulate = Some(Regulation::Explicit {
-            proteins: vec!["HUM0".into()],
-            log2fc: 3.0,
-        });
+        s.conditions[1].regulate = vec![Regulation::uniform(["HUM0"], 3.0)];
         let d = resolve(&s, &dp).unwrap();
         assert!(d.protein_quantities.iter().all(|q| q.amount_amol.is_finite()));
     }
@@ -1440,19 +1661,21 @@ mod tests {
     /// FDR answerable). But multiplying 0 by a fold change is still 0 — and flagging it
     /// `is_regulated` would have the ground truth assert that a molecule *not in the sample* was
     /// regulated. Found by review.
+    ///
+    /// This is now a **generative**-regulation test, and that is exactly the point: an
+    /// *explicitly* regulated protein can no longer be absent at all — it is forced present (see
+    /// `regulated_proteins_are_forced_into_the_sample`) — but a generative rule draws over the
+    /// whole proteome and can still land on a protein the subset excluded.
     #[test]
     fn an_absent_protein_is_never_marked_regulated() {
         let ps = hye_proteins();
         let dp: Vec<DesignProtein> = ps.iter()
             .map(|(id, seq, org)| DesignProtein { id, sequence: seq, organism: org }).collect();
 
-        // Subset to 30 proteins, then try to regulate ALL of them — most are not in the sample.
+        // Subset to 30 proteins, then regulate EVERYTHING generatively — most are not present.
         let mut s = spec(200.0, 0.0);
         s.complexity = Complexity { n_proteins: Some(30) };
-        s.conditions[1].regulate = Some(Regulation::Explicit {
-            proteins: (0..40).map(|i| format!("HUM{i}")).collect(),
-            log2fc: 2.0,
-        });
+        s.conditions[1].regulate = vec![Regulation::Generative { fraction: 1.0, log2fc_sd: 2.0 }];
         let d = resolve(&s, &dp).unwrap();
 
         for q in d.protein_quantities.iter().filter(|q| q.sample_id == "B_R1") {
@@ -1479,10 +1702,7 @@ mod tests {
             .map(|(id, seq, org)| DesignProtein { id, sequence: seq, organism: org })
             .collect();
         let mut s = spec(200.0, 0.0);
-        s.conditions[1].regulate = Some(Regulation::Explicit {
-            proteins: vec!["HUM0".into(), "NOT_A_PROTEIN".into()],
-            log2fc: 1.0,
-        });
+        s.conditions[1].regulate = vec![Regulation::uniform(["HUM0", "NOT_A_PROTEIN"], 1.0)];
         let err = resolve(&s, &dp).unwrap_err();
         assert!(err.contains("NOT_A_PROTEIN"), "{err}");
     }
@@ -1497,7 +1717,7 @@ mod tests {
             .collect();
         for (fraction, sd) in [(1.5, 1.0), (-0.1, 1.0), (f64::NAN, 1.0), (0.1, -1.0), (0.1, f64::NAN)] {
             let mut s = spec(200.0, 0.0);
-            s.conditions[1].regulate = Some(Regulation::Generative { fraction, log2fc_sd: sd });
+            s.conditions[1].regulate = vec![Regulation::Generative { fraction, log2fc_sd: sd }];
             assert!(resolve(&s, &dp).is_err(), "fraction={fraction} sd={sd} must be rejected");
         }
     }
@@ -1540,7 +1760,7 @@ mod tests {
                     mix: [("HUMAN".to_string(), Share::Fraction(1.0))].into(),
                     replicates: 300,
                     technical_replicates: 1,
-                    regulate: None,
+                    regulate: Vec::new(),
                 }],
             };
             let d = resolve(&spec, &dp).unwrap();
@@ -1586,7 +1806,7 @@ mod tests {
                 conditions: vec![Condition {
                     name: "A".into(),
                     mix: [("HUMAN".to_string(), Share::Fraction(1.0))].into(),
-                    replicates: 120, technical_replicates: 1, regulate: None,
+                    replicates: 120, technical_replicates: 1, regulate: Vec::new(),
                 }],
             }
         };
@@ -1737,7 +1957,7 @@ mod tests {
             conditions: vec![Condition {
                 name: "A".into(),
                 mix: [("HUMAN".to_string(), Share::Fraction(1.0))].into(),
-                replicates: 1, technical_replicates: 1, regulate: None,
+                replicates: 1, technical_replicates: 1, regulate: Vec::new(),
             }],
         };
         let d = resolve(&s, &dp).unwrap();
@@ -1748,6 +1968,468 @@ mod tests {
         assert!((3.0..6.0).contains(&orders),
                 "hockey stick should span a few orders, got {orders:.2}");
         assert!(d.report.mass_balance_error_ng < 1e-6);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // REGULATED ⇒ PRESENT. Force + displace.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Every present protein id in a sample, and its amount.
+    fn present_ids(d: &Design, sample: &str) -> std::collections::BTreeMap<String, f64> {
+        d.protein_quantities
+            .iter()
+            .filter(|q| q.sample_id == sample && q.amount_amol > 0.0)
+            .map(|q| (q.protein_id.clone(), q.amount_amol))
+            .collect()
+    }
+
+    /// A HUMAN protein that `n_proteins = 30` leaves OUT of the sample. This is the protein a
+    /// benchmark names and silently does not get.
+    fn an_excluded_human(dp: &[DesignProtein]) -> String {
+        let mut s = spec(200.0, 0.0);
+        s.complexity = Complexity { n_proteins: Some(30) };
+        let d = resolve(&s, dp).unwrap();
+        let present = present_ids(&d, "A_R1");
+        (0..40)
+            .map(|i| format!("HUM{i}"))
+            .find(|id| !present.contains_key(id))
+            .expect("n_proteins = 30 must exclude some human protein, else this test proves nothing")
+    }
+
+    fn dps(ps: &[(String, String, String)]) -> Vec<DesignProtein> {
+        ps.iter()
+            .map(|(id, seq, org)| DesignProtein { id, sequence: seq, organism: org })
+            .collect()
+    }
+
+    /// GAP 2, the headline. A regulated accession that `n_proteins` excluded ends up **present
+    /// and regulated** — and the sample still contains **exactly** `n_proteins` proteins, which is
+    /// what proves forcing DISPLACES rather than expands.
+    ///
+    /// Before this, PhantomBENCH's 14 regulated accessions at `n_proteins = 2400` came back with
+    /// 10 of them at `is_regulated = false`, amount 0, and no warning: a confidently wrong
+    /// benchmark whose shortfall is indistinguishable from poor tool performance.
+    #[test]
+    fn regulated_proteins_are_forced_into_the_sample() {
+        let ps = hye_proteins();
+        let dp = dps(&ps);
+        let victim = an_excluded_human(&dp);
+
+        let mut s = spec(200.0, 0.0);
+        s.complexity = Complexity { n_proteins: Some(30) };
+        s.conditions[1].regulate = vec![Regulation::Explicit {
+            proteins: [(victim.clone(), 1.5)].into_iter().collect(),
+        }];
+        let d = resolve(&s, &dp).unwrap();
+
+        // Present, regulated, and carrying material — in the arm that regulates it …
+        let q = d
+            .protein_quantities
+            .iter()
+            .find(|q| q.protein_id == victim && q.sample_id == "B_R1")
+            .unwrap();
+        assert!(q.amount_amol > 0.0, "{victim} was forced in, so it must carry material");
+        assert!(q.is_regulated, "{victim} was named in `regulate`, so it must be regulated");
+
+        // … and PRESENT in the reference arm too, or the contrast would be undefined.
+        let base = d
+            .protein_quantities
+            .iter()
+            .find(|q| q.protein_id == victim && q.sample_id == "A_R1")
+            .unwrap();
+        assert!(base.amount_amol > 0.0, "a forced protein must be in BOTH arms of the contrast");
+        assert!(!base.is_regulated, "the reference arm regulates nothing");
+        assert!(q.true_log2fc.is_finite(), "true_log2fc must be defined, not NaN");
+
+        // EXACTLY n_proteins — displace, do not expand.
+        assert_eq!(present_ids(&d, "A_R1").len(), 30);
+        assert_eq!(present_ids(&d, "B_R1").len(), 30);
+
+        // And it is reported, not silent.
+        assert_eq!(d.report.forced_present, vec![victim.clone()]);
+        assert_eq!(d.report.displaced.len(), 1);
+
+        // Mass balance still reconciles with the declared load.
+        assert!(d.report.mass_balance_error_ng < 1e-6);
+    }
+
+    /// SEED STABILITY, asserted directly rather than inferred.
+    ///
+    /// Forcing one protein in must displace exactly one — the lowest-ranked non-forced member of
+    /// its organism — and leave *every other* protein's membership untouched. It must also leave
+    /// their abundances untouched: the presence rank and the abundance draw are both keyed by
+    /// identity, so neither may depend on which other proteins were selected.
+    ///
+    /// "Untouched" is asserted as a **single common rescale**, and that is the honest formulation:
+    /// the load is fixed at 200 ng, so swapping one protein for another necessarily moves mass
+    /// between them (that is physics, and the mass-balance test above depends on it). What must
+    /// not happen is any *relative* change — so within an organism every unaffected protein must
+    /// move by the identical factor, and organisms whose membership did not change must not move
+    /// at all.
+    #[test]
+    fn forcing_a_protein_does_not_reshuffle_the_others() {
+        let ps = hye_proteins();
+        let dp = dps(&ps);
+        let victim = an_excluded_human(&dp);
+
+        let mut before = spec(200.0, 0.0);
+        before.complexity = Complexity { n_proteins: Some(30) };
+        let d0 = resolve(&before, &dp).unwrap();
+
+        let mut after = before.clone();
+        after.conditions[1].regulate = vec![Regulation::Explicit {
+            proteins: [(victim.clone(), 1.5)].into_iter().collect(),
+        }];
+        let d1 = resolve(&after, &dp).unwrap();
+
+        // MEMBERSHIP: the new set is the old set, plus the forced protein, minus exactly the
+        // deterministically displaced one. Nothing else moved.
+        let m0 = present_ids(&d0, "A_R1");
+        let m1 = present_ids(&d1, "A_R1");
+        let displaced = &d1.report.displaced;
+        assert_eq!(displaced.len(), 1, "one forced in ⇒ exactly one displaced");
+        let expected: std::collections::BTreeSet<String> = m0
+            .keys()
+            .filter(|id| **id != displaced[0])
+            .cloned()
+            .chain(std::iter::once(victim.clone()))
+            .collect();
+        let got: std::collections::BTreeSet<String> = m1.keys().cloned().collect();
+        assert_eq!(got, expected, "forcing must displace, not reshuffle");
+
+        // The displaced protein is the LOWEST-RANKED non-forced member of the organism that was
+        // in the sample — a deterministic choice, not an arbitrary one.
+        let worst_rank = m0
+            .keys()
+            .filter(|id| id.starts_with("HUM"))
+            .max_by_key(|id| stable_hash(&["present", id], before.seed))
+            .unwrap();
+        assert_eq!(&displaced[0], worst_rank);
+
+        // ABUNDANCE: organisms whose membership did not change must not move at ALL …
+        for (id, a0) in &m0 {
+            if id.starts_with("HUM") {
+                continue;
+            }
+            assert_relative_eq!(*a0, m1[id], max_relative = 1e-12);
+        }
+        // … and within the organism that did, every unaffected protein moves by the SAME factor.
+        // A single common rescale is not a reshuffle: no protein's abundance rank changed.
+        let ratios: Vec<f64> = m0
+            .iter()
+            .filter(|(id, _)| id.starts_with("HUM") && **id != displaced[0])
+            .map(|(id, a0)| m1[id] / a0)
+            .collect();
+        assert!(ratios.len() > 5, "need several proteins for this to mean anything");
+        for r in &ratios {
+            assert_relative_eq!(*r, ratios[0], max_relative = 1e-12);
+        }
+
+        // And the load still balances on both sides.
+        assert!(d0.report.mass_balance_error_ng < 1e-6);
+        assert!(d1.report.mass_balance_error_ng < 1e-6);
+    }
+
+    /// Forcing applies **per condition consistently**: naming a protein in one arm makes it
+    /// present in every arm, so the contrast is always defined. Regulating it in the *reference*
+    /// instead must give the same present set.
+    #[test]
+    fn forcing_is_consistent_across_conditions() {
+        let ps = hye_proteins();
+        let dp = dps(&ps);
+        let victim = an_excluded_human(&dp);
+
+        let mut base = spec(200.0, 0.0);
+        base.complexity = Complexity { n_proteins: Some(30) };
+
+        let reg = vec![Regulation::Explicit {
+            proteins: [(victim.clone(), 1.5)].into_iter().collect(),
+        }];
+
+        let mut in_b = base.clone();
+        in_b.conditions[1].regulate = reg.clone();
+        let mut in_a = base.clone();
+        in_a.conditions[0].regulate = reg;
+
+        let ids = |d: &Design, s: &str| -> std::collections::BTreeSet<String> {
+            present_ids(d, s).keys().cloned().collect()
+        };
+        let da = resolve(&in_a, &dp).unwrap();
+        let db = resolve(&in_b, &dp).unwrap();
+        assert_eq!(ids(&da, "A_R1"), ids(&db, "A_R1"));
+        assert_eq!(ids(&da, "B_R1"), ids(&db, "B_R1"));
+        assert!(ids(&da, "A_R1").contains(&victim) && ids(&da, "B_R1").contains(&victim));
+    }
+
+    /// A regulated set that cannot fit inside `n_proteins` is an ERROR — and the message names
+    /// the minimum that fits, so the user does not have to bisect for it.
+    #[test]
+    fn a_regulated_set_larger_than_n_proteins_is_rejected() {
+        let ps = hye_proteins();
+        let dp = dps(&ps);
+
+        let mut s = spec(200.0, 0.0);
+        s.complexity = Complexity { n_proteins: Some(10) };
+        s.conditions[1].regulate = vec![Regulation::uniform(
+            (0..20).map(|i| format!("HUM{i}")),
+            1.0,
+        )];
+        let err = resolve(&s, &dp).unwrap_err();
+        // 20 forced HUMAN + 1 YEAST floor + 1 ECOLI floor = 22.
+        assert!(err.contains("22"), "the error must name the minimum n_proteins that fits: {err}");
+        assert!(err.contains("10"), "and the value that was asked for: {err}");
+
+        // At the named minimum it resolves, and every regulated protein is in.
+        s.complexity = Complexity { n_proteins: Some(22) };
+        let d = resolve(&s, &dp).unwrap();
+        assert_eq!(present_ids(&d, "B_R1").len(), 22);
+        assert_eq!(
+            d.protein_quantities
+                .iter()
+                .filter(|q| q.sample_id == "B_R1" && q.is_regulated)
+                .count(),
+            20
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // GAP 1: per-protein magnitudes, and requested vs realised.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// GAP 1. Each named protein moves by **its own** magnitude, and the authored spread survives.
+    ///
+    /// A uniform log2fc makes a volcano rank the planted set by *noise* instead of by effect size:
+    /// the protein designed to top it does so only by chance. So the load-bearing assertion is not
+    /// "the fold changes are positive" but that the **differences between them are exactly the
+    /// authored differences** — the load renormalisation shifts every regulated protein by one
+    /// common compositional constant, and nothing else.
+    #[test]
+    fn each_regulated_protein_moves_by_its_own_magnitude() {
+        let ps = hye_proteins();
+        let dp = dps(&ps);
+
+        let authored: Vec<(String, f64)> = vec![
+            ("HUM0".to_string(), 1.8),
+            ("HUM1".to_string(), 1.0),
+            ("HUM2".to_string(), 0.5),
+        ];
+        let mut s = spec(200.0, 0.0);
+        s.conditions[1].regulate = vec![Regulation::Explicit {
+            proteins: authored.iter().cloned().collect(),
+        }];
+        let d = resolve(&s, &dp).unwrap();
+
+        let q = |p: &str| {
+            d.protein_quantities
+                .iter()
+                .find(|q| q.protein_id == p && q.sample_id == "B_R1")
+                .unwrap()
+        };
+
+        // requested_log2fc carries the AUTHORED value, verbatim.
+        for (id, fc) in &authored {
+            assert_eq!(q(id).requested_log2fc, Some(*fc), "{id} lost its authored magnitude");
+        }
+        assert_eq!(q("HUM9").requested_log2fc, None, "an unregulated protein requests nothing");
+
+        // The realised values differ from the requested ones (the load renormalisation), but the
+        // authored SPREAD is preserved exactly — this is what a uniform-magnitude implementation
+        // cannot produce.
+        let offset = q("HUM0").true_log2fc - 1.8;
+        assert!(offset.abs() > 1e-6, "the compositional shift must be real, else this proves nothing");
+        for (id, fc) in &authored {
+            assert_relative_eq!(q(id).true_log2fc - fc, offset, max_relative = 1e-9);
+        }
+        assert_relative_eq!(
+            q("HUM0").true_log2fc - q("HUM2").true_log2fc,
+            1.3,
+            max_relative = 1e-9
+        );
+        assert!(d.report.mass_balance_error_ng < 1e-6);
+    }
+
+    /// `true_log2fc` is the **realised** quantity ratio, recomputed from the emitted amounts —
+    /// not the number the user typed. `requested_log2fc` is the number the user typed. Keeping
+    /// them apart is the whole point: a declared 1.0 realises as ~0.94 once the sample is
+    /// renormalised to a fixed load, and with per-protein magnitudes that distortion varies.
+    #[test]
+    fn true_log2fc_is_realised_and_requested_log2fc_is_authored() {
+        let ps = hye_proteins();
+        let dp = dps(&ps);
+
+        let mut s = spec(200.0, 0.0);
+        s.conditions[1].regulate = vec![Regulation::uniform(
+            (0..15).map(|i| format!("HUM{i}")),
+            1.0,
+        )];
+        let d = resolve(&s, &dp).unwrap();
+
+        let amt = |p: &str, sample: &str| {
+            d.protein_quantities
+                .iter()
+                .find(|q| q.protein_id == p && q.sample_id == sample)
+                .unwrap()
+                .amount_amol
+        };
+        let q = d
+            .protein_quantities
+            .iter()
+            .find(|q| q.protein_id == "HUM0" && q.sample_id == "B_R1")
+            .unwrap();
+
+        // Realised: recomputed independently from the amounts that were actually emitted.
+        assert_relative_eq!(
+            q.true_log2fc,
+            (amt("HUM0", "B_R1") / amt("HUM0", "A_R1")).log2(),
+            max_relative = 1e-9
+        );
+        // Requested: the authored intervention.
+        assert_eq!(q.requested_log2fc, Some(1.0));
+        // And they are NOT the same number — the renormalisation ate part of the declared move.
+        assert!(
+            (q.true_log2fc - 1.0).abs() > 1e-3,
+            "realised {} should differ from requested 1.0",
+            q.true_log2fc
+        );
+        assert!(q.true_log2fc < 1.0);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Collision rules: deterministic, not iteration order.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// The same accession in two explicit blocks has no defined composition, so it is refused —
+    /// rather than resolved by whichever block happens to be written last.
+    #[test]
+    fn a_protein_named_in_two_explicit_blocks_is_rejected() {
+        let ps = hye_proteins();
+        let dp = dps(&ps);
+        let mut s = spec(200.0, 0.0);
+        s.conditions[1].regulate = vec![
+            Regulation::Explicit { proteins: [("HUM0".to_string(), 1.6)].into_iter().collect() },
+            Regulation::Explicit { proteins: [("HUM0".to_string(), 0.7)].into_iter().collect() },
+        ];
+        let err = resolve(&s, &dp).unwrap_err();
+        assert!(err.contains("HUM0") && err.contains("more than one"), "{err}");
+    }
+
+    /// The stale-accession guard covers **every** entry in **every** block — not just the first.
+    #[test]
+    fn a_stale_accession_in_any_block_is_rejected() {
+        let ps = hye_proteins();
+        let dp = dps(&ps);
+        let mut s = spec(200.0, 0.0);
+        s.conditions[1].regulate = vec![
+            Regulation::Explicit { proteins: [("HUM0".to_string(), 1.6)].into_iter().collect() },
+            Regulation::Generative { fraction: 0.05, log2fc_sd: 1.0 },
+            Regulation::Explicit { proteins: [("NOT_A_PROTEIN".to_string(), 0.7)].into_iter().collect() },
+        ];
+        let err = resolve(&s, &dp).unwrap_err();
+        assert!(err.contains("NOT_A_PROTEIN"), "{err}");
+    }
+
+    /// Explicit beats generative for the same protein, deterministically. The generative rule is
+    /// a statement about the *background*; a named magnitude is what the user meant.
+    #[test]
+    fn an_explicit_magnitude_wins_over_a_generative_draw() {
+        let ps = hye_proteins();
+        let dp = dps(&ps);
+
+        // fraction = 1.0 ⇒ the generative rule selects EVERY protein, so the overlap is total.
+        let mut s = spec(200.0, 0.0);
+        s.conditions[1].regulate = vec![
+            Regulation::Explicit { proteins: [("HUM0".to_string(), 2.0)].into_iter().collect() },
+            Regulation::Generative { fraction: 1.0, log2fc_sd: 1.0 },
+        ];
+        let d = resolve(&s, &dp).unwrap();
+        let q = d
+            .protein_quantities
+            .iter()
+            .find(|q| q.protein_id == "HUM0" && q.sample_id == "B_R1")
+            .unwrap();
+        assert_eq!(q.requested_log2fc, Some(2.0), "the explicit magnitude must win");
+
+        // Block order must not matter.
+        let mut swapped = spec(200.0, 0.0);
+        swapped.conditions[1].regulate = vec![
+            Regulation::Generative { fraction: 1.0, log2fc_sd: 1.0 },
+            Regulation::Explicit { proteins: [("HUM0".to_string(), 2.0)].into_iter().collect() },
+        ];
+        let d2 = resolve(&swapped, &dp).unwrap();
+        for (a, b) in d.protein_quantities.iter().zip(&d2.protein_quantities) {
+            assert_eq!(a.protein_id, b.protein_id);
+            assert_relative_eq!(a.amount_amol, b.amount_amol, max_relative = 1e-12);
+            assert_eq!(a.requested_log2fc, b.requested_log2fc);
+        }
+    }
+
+    /// Two generative blocks in one condition have no defined composition, so they are refused.
+    #[test]
+    fn two_generative_blocks_in_one_condition_are_rejected() {
+        let ps = hye_proteins();
+        let dp = dps(&ps);
+        let mut s = spec(200.0, 0.0);
+        s.conditions[1].regulate = vec![
+            Regulation::Generative { fraction: 0.05, log2fc_sd: 1.0 },
+            Regulation::Generative { fraction: 0.10, log2fc_sd: 0.5 },
+        ];
+        let err = resolve(&s, &dp).unwrap_err();
+        assert!(err.contains("at most one generative"), "{err}");
+    }
+
+    /// Forcing a protein whose abundance profile gives it zero material is refused: it would be
+    /// present with amount 0, `is_regulated` would be false, and the named intervention would
+    /// vanish — the same silent drop, one layer further down.
+    #[test]
+    fn forcing_a_protein_with_no_abundance_is_rejected() {
+        let ps = hye_proteins();
+        let dp = dps(&ps);
+
+        let mut s = spec(200.0, 0.0);
+        let table: HashMap<String, f64> = (1..40).map(|i| (format!("HUM{i}"), 1.0)).collect();
+        s.abundance.insert("HUMAN".into(), AbundanceProfile::Table(table)); // HUM0 missing ⇒ 0
+        s.conditions[1].regulate = vec![Regulation::uniform(["HUM0"], 1.0)];
+        let err = resolve(&s, &dp).unwrap_err();
+        assert!(err.contains("HUM0") && err.contains("zero abundance"), "{err}");
+    }
+
+    /// REGRESSION: two runs of the identical design must produce BIT-IDENTICAL amounts.
+    ///
+    /// The per-sample load rescale sums every protein's mass. That sum used to iterate the
+    /// `amounts` HashMap, whose order depends on a per-process random seed — so the total, and
+    /// therefore the rescale factor, and therefore every amount in the answer key, differed in the
+    /// last bits between two runs of the same spec. It never showed up in a test (every tolerance
+    /// in this file is 1e-9 or looser) and it made byte-comparing two artifacts impossible, which
+    /// is exactly how a reproducibility guarantee dies quietly.
+    ///
+    /// One process cannot observe the effect — the seed is per process, not per call — so this
+    /// asserts the property that *causes* it: the sums run in a deterministic (Vec) order.
+    #[test]
+    fn two_resolves_of_one_spec_are_bit_identical() {
+        let ps = hye_proteins();
+        let dp = dps(&ps);
+        let mut s = spec(200.0, 0.2);
+        s.complexity = Complexity { n_proteins: Some(50) };
+        s.conditions[1].regulate = vec![Regulation::Explicit {
+            proteins: [("HUM0".to_string(), 1.6), ("YST0".to_string(), -0.7)].into_iter().collect(),
+        }];
+
+        let a = resolve(&s, &dp).unwrap();
+        let b = resolve(&s, &dp).unwrap();
+        assert_eq!(a.protein_quantities.len(), b.protein_quantities.len());
+        for (x, y) in a.protein_quantities.iter().zip(&b.protein_quantities) {
+            assert_eq!(x.protein_id, y.protein_id);
+            assert_eq!(
+                x.amount_amol.to_bits(),
+                y.amount_amol.to_bits(),
+                "{} drifted between two resolves of the same spec",
+                x.protein_id
+            );
+        }
+        assert_eq!(
+            a.report.mass_balance_error_ng.to_bits(),
+            b.report.mass_balance_error_ng.to_bits()
+        );
     }
 
     /// A mixture that does not sum to 1, with no `rest`, is an error rather than a silent
