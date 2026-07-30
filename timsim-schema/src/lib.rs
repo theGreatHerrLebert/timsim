@@ -239,6 +239,65 @@ fn major(v: &str) -> &str {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// The row-group size an artifact is written at — parquet's `DEFAULT_MAX_ROW_GROUP_SIZE`, which is
+/// what [`write`] gets by not overriding it. Exposed because a **streaming** producer that wants its
+/// output to be byte-identical to a single-batch [`write`] must hand [`Writer`] batches that line up
+/// with this boundary; [`Writer`] does that re-alignment itself, and a caller that is already aligned
+/// pays nothing for it. See [`Writer`] for why the alignment is what makes the bytes identical.
+pub const ROW_GROUP_ROWS: usize = parquet::file::properties::DEFAULT_MAX_ROW_GROUP_SIZE;
+
+/// The compression an artifact is written with. One definition, shared by [`write_with`] and
+/// [`Writer`], so a streamed file cannot drift from a single-batch one.
+fn writer_properties() -> WriterProperties {
+    WriterProperties::builder()
+        .set_compression(parquet::basic::Compression::ZSTD(Default::default()))
+        .build()
+}
+
+/// The key-value metadata stamped into every artifact of `table`.
+fn stamp_kv(
+    spec: &TableSpec,
+    table: &str,
+    producer: &str,
+    scope: Option<&str>,
+    extra: &[(&str, String)],
+) -> Vec<(String, String)> {
+    let mut kv = vec![
+        (meta::VERSION.to_string(), SCHEMA_VERSION.to_string()),
+        (meta::TABLE.to_string(), table.to_string()),
+        (meta::AXIS.to_string(), spec.axis.as_str().to_string()),
+        (meta::PRODUCER.to_string(), producer.to_string()),
+    ];
+    if let Some(s) = scope {
+        kv.push((meta::SCOPE.to_string(), s.to_string()));
+    }
+    for (k, v) in extra {
+        kv.push((k.to_string(), v.clone()));
+    }
+    kv
+}
+
+/// Re-stamp a batch's schema with the artifact metadata, preserving the field definitions (so an
+/// extra column a stage chose to annotate with survives).
+fn stamped_schema(batch_schema: &SchemaRef, kv: &[(String, String)]) -> SchemaRef {
+    let mut md: HashMap<String, String> = batch_schema.metadata().clone();
+    for (k, v) in kv {
+        md.insert(k.clone(), v.clone());
+    }
+    std::sync::Arc::new(
+        arrow::datatypes::Schema::new(batch_schema.fields().clone()).with_metadata(md),
+    )
+}
+
+fn lookup(table: &str) -> Result<TableSpec, SchemaError> {
+    tables::by_name(table).ok_or_else(|| {
+        SchemaError::UnknownTable(
+            table.to_string(),
+            tables::all().iter().map(|t| t.name).collect::<Vec<_>>().join(", "),
+        )
+    })
+}
+
 /// Write a record batch as a timsim artifact, stamping the schema metadata.
 pub fn write(
     path: impl AsRef<Path>,
@@ -260,12 +319,7 @@ pub fn write_with(
     scope: Option<&str>,
     extra: &[(&str, String)],
 ) -> Result<(), SchemaError> {
-    let spec = tables::by_name(table).ok_or_else(|| {
-        SchemaError::UnknownTable(
-            table.to_string(),
-            tables::all().iter().map(|t| t.name).collect::<Vec<_>>().join(", "),
-        )
-    })?;
+    let spec = lookup(table)?;
 
     if let Some(report) = conformance_report(&spec, &batch.schema()) {
         return Err(SchemaError::Nonconforming {
@@ -276,37 +330,205 @@ pub fn write_with(
         });
     }
 
-    let mut kv = vec![
-        (meta::VERSION, SCHEMA_VERSION.to_string()),
-        (meta::TABLE, table.to_string()),
-        (meta::AXIS, spec.axis.as_str().to_string()),
-        (meta::PRODUCER, producer.to_string()),
-    ];
-    if let Some(s) = scope {
-        kv.push((meta::SCOPE, s.to_string()));
-    }
-    for (k, v) in extra {
-        kv.push((k, v.clone()));
-    }
-
-    // Re-stamp the batch's schema with our metadata, preserving the field definitions.
-    let mut md: HashMap<String, String> = batch.schema().metadata().clone();
-    for (k, v) in kv {
-        md.insert(k.to_string(), v);
-    }
-    let schema = std::sync::Arc::new(
-        arrow::datatypes::Schema::new(batch.schema().fields().clone()).with_metadata(md),
-    );
+    let kv = stamp_kv(&spec, table, producer, scope, extra);
+    let schema = stamped_schema(&batch.schema(), &kv);
     let batch = RecordBatch::try_new(schema.clone(), batch.columns().to_vec())?;
 
     let file = File::create(path)?;
-    let props = WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::ZSTD(Default::default()))
-        .build();
-    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
+    let mut writer = ArrowWriter::try_new(file, schema, Some(writer_properties()))?;
     writer.write(&batch)?;
     writer.close()?;
     Ok(())
+}
+
+/// A **streaming** artifact writer: the same file [`write`] produces, but built a batch at a time so
+/// a producer never has to hold the whole table in memory.
+///
+/// # Why this exists
+///
+/// [`write`] takes one `RecordBatch`, which forces a stage to materialise every row before a single
+/// byte reaches disk. For `ion_spectra` at full-proteome scale that is tens of GB of peak lists held
+/// only so they can be handed to the writer once. A stage that can produce its rows in order — and
+/// they all can — should be able to stream them out.
+///
+/// # Why a streamed file is byte-identical to a single-batch one
+///
+/// Not automatic, and worth stating exactly, because the *content* being equal is not the same claim
+/// as the *bytes* being equal — and downstream caching keys on the bytes.
+///
+/// Parquet page boundaries are decided by a size check performed every `write_batch_size` (1024)
+/// **levels**, and the level counter restarts on every call into the column writer. So chopping a
+/// table into arbitrary batches moves the check points, which moves the page boundaries, which
+/// changes the bytes even though every value is the same. The one place the arrow writer *does*
+/// restart that counter identically is at a **row-group boundary**: given one huge batch it splits it
+/// into [`ROW_GROUP_ROWS`]-row slices and feeds them one at a time. Feed it exactly those slices and
+/// it cannot tell the difference.
+///
+/// So this writer buffers whatever it is given and only ever hands the underlying writer whole
+/// [`ROW_GROUP_ROWS`]-row units (plus the final short one). A caller already aligned to that boundary
+/// — the intended case — takes a pass-through path that copies nothing; an unaligned caller pays one
+/// concatenation per row group and gets the same bytes anyway.
+///
+/// ```no_run
+/// # fn main() -> Result<(), timsim_schema::SchemaError> {
+/// # let batches: Vec<arrow::record_batch::RecordBatch> = vec![];
+/// let mut w = timsim_schema::Writer::new("out.parquet", "ion_spectra", "timsim-spectra", None)?;
+/// for batch in &batches {
+///     w.write(batch)?;
+/// }
+/// w.close()?;
+/// # Ok(()) }
+/// ```
+pub struct Writer {
+    path: std::path::PathBuf,
+    table: String,
+    spec: TableSpec,
+    kv: Vec<(String, String)>,
+    /// Created on the first batch, so the file schema keeps that batch's field definitions exactly
+    /// as [`write_with`] does (extra columns included).
+    inner: Option<ArrowWriter<File>>,
+    /// The stamped schema the file declares, fixed by the first batch.
+    file_schema: Option<SchemaRef>,
+    /// Rows not yet forming a whole row group.
+    pending: Vec<RecordBatch>,
+    pending_rows: usize,
+    rows: u64,
+}
+
+impl Writer {
+    /// Open a streaming writer. The file is created on the first [`Writer::write`] (or on
+    /// [`Writer::close`] if no row is ever written, which yields a valid empty artifact).
+    pub fn new(
+        path: impl AsRef<Path>,
+        table: &str,
+        producer: &str,
+        scope: Option<&str>,
+    ) -> Result<Self, SchemaError> {
+        Self::new_with(path, table, producer, scope, &[])
+    }
+
+    /// As [`Writer::new`], with the extra key-value metadata [`write_with`] accepts.
+    pub fn new_with(
+        path: impl AsRef<Path>,
+        table: &str,
+        producer: &str,
+        scope: Option<&str>,
+        extra: &[(&str, String)],
+    ) -> Result<Self, SchemaError> {
+        let spec = lookup(table)?;
+        let kv = stamp_kv(&spec, table, producer, scope, extra);
+        Ok(Writer {
+            path: path.as_ref().to_path_buf(),
+            table: table.to_string(),
+            spec,
+            kv,
+            inner: None,
+            file_schema: None,
+            pending: Vec::new(),
+            pending_rows: 0,
+            rows: 0,
+        })
+    }
+
+    /// Rows accepted so far.
+    pub fn rows(&self) -> u64 {
+        self.rows
+    }
+
+    /// Append a batch. Conformance is checked per batch, at the same boundary and with the same
+    /// message [`write`] would give.
+    pub fn write(&mut self, batch: &RecordBatch) -> Result<(), SchemaError> {
+        if let Some(report) = conformance_report(&self.spec, &batch.schema()) {
+            return Err(SchemaError::Nonconforming {
+                path: self.path.display().to_string(),
+                table: self.table.clone(),
+                version: SCHEMA_VERSION.to_string(),
+                report,
+            });
+        }
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        self.rows += batch.num_rows() as u64;
+
+        // Fast path: nothing buffered, so whole row groups can go straight through — the arrow
+        // writer splits them at exactly the boundary we would have split them at, and no data is
+        // copied. This is the path the streaming stages take.
+        if self.pending_rows == 0 {
+            let whole = batch.num_rows() - batch.num_rows() % ROW_GROUP_ROWS;
+            if whole > 0 {
+                self.emit(&batch.slice(0, whole))?;
+            }
+            if whole < batch.num_rows() {
+                self.pending_rows = batch.num_rows() - whole;
+                self.pending.push(batch.slice(whole, self.pending_rows));
+            }
+            return Ok(());
+        }
+
+        self.pending_rows += batch.num_rows();
+        self.pending.push(batch.clone());
+        while self.pending_rows >= ROW_GROUP_ROWS {
+            let group = self.take_pending(ROW_GROUP_ROWS)?;
+            self.emit(&group)?;
+        }
+        Ok(())
+    }
+
+    /// Flush the tail and finalise the file.
+    pub fn close(mut self) -> Result<(), SchemaError> {
+        if self.pending_rows > 0 {
+            let tail = self.take_pending(self.pending_rows)?;
+            self.emit(&tail)?;
+        }
+        match self.inner.take() {
+            Some(w) => {
+                w.close()?;
+            }
+            // Nothing was ever written: still produce a real, stamped, empty artifact rather than
+            // leaving a consumer to trip over a missing file.
+            None => {
+                let schema = stamped_schema(&self.spec.schema, &self.kv);
+                let file = File::create(&self.path)?;
+                ArrowWriter::try_new(file, schema, Some(writer_properties()))?.close()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Pull exactly `n` rows off the front of `pending`, concatenated into one batch.
+    fn take_pending(&mut self, n: usize) -> Result<RecordBatch, SchemaError> {
+        let schema = self.pending[0].schema();
+        let mut take: Vec<RecordBatch> = Vec::new();
+        let mut left = n;
+        while left > 0 {
+            let front = self.pending.remove(0);
+            if front.num_rows() <= left {
+                left -= front.num_rows();
+                take.push(front);
+            } else {
+                take.push(front.slice(0, left));
+                self.pending.insert(0, front.slice(left, front.num_rows() - left));
+                left = 0;
+            }
+        }
+        self.pending_rows -= n;
+        Ok(arrow::compute::concat_batches(&schema, &take)?)
+    }
+
+    fn emit(&mut self, batch: &RecordBatch) -> Result<(), SchemaError> {
+        if self.inner.is_none() {
+            let schema = stamped_schema(&batch.schema(), &self.kv);
+            let file = File::create(&self.path)?;
+            self.inner = Some(ArrowWriter::try_new(file, schema.clone(), Some(writer_properties()))?);
+            self.file_schema = Some(schema);
+        }
+        // Re-stamp so the batch carries exactly the schema the file declares (as `write_with` does).
+        let schema = self.file_schema.clone().unwrap();
+        let batch = RecordBatch::try_new(schema, batch.columns().to_vec())?;
+        self.inner.as_mut().unwrap().write(&batch)?;
+        Ok(())
+    }
 }
 
 /// Read a timsim artifact, **validating it against the declared schema first**.

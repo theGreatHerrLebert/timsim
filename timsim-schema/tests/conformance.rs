@@ -226,3 +226,156 @@ fn an_unstamped_parquet_file_is_not_a_timsim_artifact() {
     assert!(matches!(err, SchemaError::Unstamped { .. }), "got: {err}");
     assert!(err.to_string().contains("not a timsim artifact"), "{err}");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The streaming writer.
+
+/// `n` rows of `ion_spectra` — a LIST-column table, which is the hard case for byte identity: page
+/// boundaries there are decided on the *level* counter, not the row counter.
+fn ion_spectra_rows(first: u64, n: usize, peaks: usize) -> RecordBatch {
+    use arrow::array::{Float32Builder, Float64Builder, ListBuilder, UInt8Array};
+    let spec = tables::ion_spectra::spec();
+    let mut mz = ListBuilder::new(Float64Builder::new());
+    let mut inten = ListBuilder::new(Float32Builder::new());
+    let mut ids: Vec<u64> = Vec::with_capacity(n);
+    let mut level: Vec<u8> = Vec::with_capacity(n);
+    for i in 0..n {
+        let id = first + i as u64;
+        ids.push(id);
+        level.push(if id % 2 == 0 { 1 } else { 2 });
+        // Vary the peak count per row so the level counter and the row counter never line up —
+        // exactly the situation that makes naive chunking move page boundaries. Keyed on the row's
+        // id, NOT its index in the batch, so a row's content cannot depend on how it was chunked.
+        for k in 0..(peaks + (id as usize % 7)) {
+            mz.values().append_value(300.0 + (id as f64) * 0.001 + k as f64);
+            inten.values().append_value((k as f32 + 1.0) / (id as f32 + 1.0));
+        }
+        mz.append(true);
+        inten.append(true);
+    }
+    RecordBatch::try_new(
+        spec.schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(ids)),
+            Arc::new(UInt8Array::from(level)),
+            Arc::new(mz.finish()),
+            Arc::new(inten.finish()),
+        ],
+    )
+    .unwrap()
+}
+
+/// **THE streaming test.** A file streamed in many batches must be byte-for-byte the file `write`
+/// would have produced from one batch — not merely "the same values". Downstream caching keys on the
+/// file hash, so a re-chunked writer that changed page boundaries would silently invalidate every
+/// cached node below it and make a memory fix look like a data change.
+///
+/// The batch sizes below are deliberately hostile: none is a multiple of the row-group size, one is
+/// larger than a row group, and the row/level counters never line up.
+#[test]
+fn a_streamed_file_is_byte_identical_to_a_single_batch_write() {
+    use timsim_schema::{Writer, ROW_GROUP_ROWS};
+    // Enough rows to cross a row-group boundary (that is where the interesting split happens),
+    // with one peak per row so the test stays cheap.
+    let total = ROW_GROUP_ROWS + 5_000;
+
+    let one = tmp("stream_one.parquet");
+    write(&one, "ion_spectra", &ion_spectra_rows(1, total, 1), "test/1.0", None).unwrap();
+
+    let many = tmp("stream_many.parquet");
+    let mut w = Writer::new(&many, "ion_spectra", "test/1.0", None).unwrap();
+    let mut at = 0usize;
+    for size in [1usize, 999, 300_000, ROW_GROUP_ROWS + 1] {
+        let n = size.min(total - at);
+        if n == 0 {
+            break;
+        }
+        w.write(&ion_spectra_rows(1 + at as u64, n, 1)).unwrap();
+        at += n;
+    }
+    if at < total {
+        w.write(&ion_spectra_rows(1 + at as u64, total - at, 1)).unwrap();
+        at = total;
+    }
+    assert_eq!(at, total);
+    assert_eq!(w.rows(), total as u64);
+    w.close().unwrap();
+
+    let a = std::fs::read(&one).unwrap();
+    let b = std::fs::read(&many).unwrap();
+    assert_eq!(a.len(), b.len(), "streamed file has a different size");
+    assert!(a == b, "streamed file is not byte-identical to the single-batch write");
+}
+
+/// Byte identity must hold for the fat-row case too — many peaks per row, so pages actually fill up
+/// and get flushed mid-batch. This is the shape `timsim-spectra` really writes.
+#[test]
+fn byte_identity_holds_when_pages_actually_split() {
+    use timsim_schema::Writer;
+    let total = 20_000;
+
+    let one = tmp("stream_fat_one.parquet");
+    write(&one, "ion_spectra", &ion_spectra_rows(1, total, 80), "test/1.0", None).unwrap();
+
+    let many = tmp("stream_fat_many.parquet");
+    let mut w = Writer::new(&many, "ion_spectra", "test/1.0", None).unwrap();
+    let mut at = 0usize;
+    while at < total {
+        let n = (1 + at % 1337).min(total - at);
+        w.write(&ion_spectra_rows(1 + at as u64, n, 80)).unwrap();
+        at += n;
+    }
+    w.close().unwrap();
+
+    assert!(
+        std::fs::read(&one).unwrap() == std::fs::read(&many).unwrap(),
+        "page splitting must not depend on how the producer chunked its batches"
+    );
+}
+
+/// The streamed file is a first-class artifact: same stamp, same conformance refusal.
+#[test]
+fn the_streaming_writer_stamps_and_validates_like_write() {
+    use timsim_schema::Writer;
+    let path = tmp("stream_stamp.parquet");
+    let mut w = Writer::new(&path, "peptide_quantities", "test/1.0", Some("c18/hela")).unwrap();
+    w.write(&good_peptide_quantities()).unwrap();
+    w.write(&good_peptide_quantities()).unwrap();
+    w.close().unwrap();
+
+    let batches = read(&path, "peptide_quantities").unwrap();
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 6);
+    let md = timsim_schema::metadata(&path).unwrap();
+    assert_eq!(md.get(timsim_schema::meta::PRODUCER).unwrap(), "test/1.0");
+    assert_eq!(md.get(timsim_schema::meta::SCOPE).unwrap(), "c18/hela");
+    assert_eq!(md.get(timsim_schema::meta::AXIS).unwrap(), "quantity");
+
+    // A renamed column is refused at the same boundary, with the same message.
+    let bad = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("peptide_id", DataType::UInt64, false),
+            Field::new("sample", DataType::Utf8, false),
+            Field::new("amount", DataType::Float64, false),
+        ])),
+        vec![
+            Arc::new(UInt64Array::from(vec![1u64])),
+            Arc::new(StringArray::from(vec!["A_R1"])),
+            Arc::new(Float64Array::from(vec![1.0])),
+        ],
+    )
+    .unwrap();
+    let mut w = Writer::new(tmp("stream_bad.parquet"), "peptide_quantities", "t", None).unwrap();
+    let err = w.write(&bad).unwrap_err();
+    assert!(matches!(err, SchemaError::Nonconforming { .. }), "got: {err}");
+}
+
+/// A writer that is never given a row still produces a real, stamped, readable artifact — a stage
+/// whose input happened to be empty must not leave a hole where its output should be.
+#[test]
+fn a_streaming_writer_with_no_rows_still_produces_an_artifact() {
+    use timsim_schema::Writer;
+    let path = tmp("stream_empty.parquet");
+    Writer::new(&path, "ion_spectra", "test/1.0", None).unwrap().close().unwrap();
+    let batches = read(&path, "ion_spectra").unwrap();
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+}
