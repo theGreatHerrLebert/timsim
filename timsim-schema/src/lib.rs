@@ -22,6 +22,19 @@
 //!
 //! Necroflow adds a third layer above both: typed `NodeType` edges are checked at
 //! rule-call time, so a mis-wiring fails before the DAG executes at all.
+//!
+//! # The fourth layer: values, not just columns
+//!
+//! Conformance proves an artifact has the right *columns*. It cannot prove it holds the right
+//! *numbers* — and a stage once wrote eighteen million rows in which four m/z values were
+//! physically impossible, the real values had shifted into the neighbouring rows, and the job
+//! exited 0. Parquet's page CRCs and ZSTD's frame checksums certified all of it, because both are
+//! computed **after** the bad values reach the writer.
+//!
+//! [`integrity`] closes that gap: every artifact this crate writes is hashed over its *logical
+//! values* on the way in, the hashes land in a `<file>.integrity.json` sidecar, and
+//! [`verify`] independently re-reads the file and recomputes them. See that module for the
+//! canonical serialisation and why in-format checksums are not a substitute.
 
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -32,7 +45,9 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
+pub mod integrity;
 pub mod tables;
+pub use integrity::verify;
 pub use tables::SCHEMA_VERSION;
 
 /// Which axis of the model a table belongs to. Recorded in the file so an artifact is
@@ -136,6 +151,28 @@ pub enum SchemaError {
         path: String,
         found: String,
         expected: String,
+    },
+
+    /// The sidecar exists but is not a manifest. Distinct from *absent* — an absent sidecar is
+    /// merely [`integrity::Status::Unverifiable`], whereas an unreadable one is a real fault.
+    #[error("{path}: integrity manifest is unreadable — {detail}")]
+    Manifest { path: String, detail: String },
+
+    /// The row-group partition the integrity gate hashed is not the one the writer laid down.
+    ///
+    /// The gate must hash *before* the values are handed over, which means predicting where the
+    /// writer will cut. Rather than let a wrong prediction produce a manifest that can never
+    /// verify — an integrity control that cries wolf is worse than none — the prediction is
+    /// checked against the writer's own metadata and a disagreement stops the write.
+    #[error(
+        "{path}: the integrity gate hashed row groups of {expected:?} rows but the writer laid \
+         down {found:?}.\n  \
+         The manifest would describe a partition this file does not have, so it was not written."
+    )]
+    RowGroupLayout {
+        path: String,
+        expected: Vec<u64>,
+        found: Vec<u64>,
     },
 
     /// The GRU error, caught at the boundary instead of three stages downstream.
@@ -319,11 +356,12 @@ pub fn write_with(
     scope: Option<&str>,
     extra: &[(&str, String)],
 ) -> Result<(), SchemaError> {
+    let path = path.as_ref();
     let spec = lookup(table)?;
 
     if let Some(report) = conformance_report(&spec, &batch.schema()) {
         return Err(SchemaError::Nonconforming {
-            path: path.as_ref().display().to_string(),
+            path: path.display().to_string(),
             table: table.to_string(),
             version: SCHEMA_VERSION.to_string(),
             report,
@@ -334,10 +372,27 @@ pub fn write_with(
     let schema = stamped_schema(&batch.schema(), &kv);
     let batch = RecordBatch::try_new(schema.clone(), batch.columns().to_vec())?;
 
+    // THE GATE. Hash the logical values here — while they are still values — because every
+    // checksum downstream of this line is computed on whatever the writer was given and will
+    // certify a corrupted batch just as cheerfully as a good one. See [`integrity`].
+    let groups = integrity::digest_batch(&batch, 0);
+    let coverage = integrity::Coverage::of(&batch);
+
     let file = File::create(path)?;
     let mut writer = ArrowWriter::try_new(file, schema, Some(writer_properties()))?;
     writer.write(&batch)?;
-    writer.close()?;
+    let file_meta = writer.close()?;
+
+    integrity::check_layout(path, &groups, &file_meta)?;
+    integrity::write_manifest(
+        path,
+        &spec,
+        table,
+        producer,
+        batch.num_rows() as u64,
+        coverage,
+        groups,
+    )?;
     Ok(())
 }
 
@@ -393,6 +448,12 @@ pub struct Writer {
     pending: Vec<RecordBatch>,
     pending_rows: usize,
     rows: u64,
+    /// The integrity gate's running record: one digest per row group, taken in [`Writer::emit`]
+    /// before the batch is handed over, in the same order the writer will lay them down.
+    groups: Vec<integrity::RowGroupDigest>,
+    /// Column coverage, fixed by the first batch (all batches share a schema).
+    coverage: integrity::Coverage,
+    producer: String,
 }
 
 impl Writer {
@@ -427,6 +488,9 @@ impl Writer {
             pending: Vec::new(),
             pending_rows: 0,
             rows: 0,
+            groups: Vec::new(),
+            coverage: integrity::Coverage::default(),
+            producer: producer.to_string(),
         })
     }
 
@@ -481,18 +545,29 @@ impl Writer {
             let tail = self.take_pending(self.pending_rows)?;
             self.emit(&tail)?;
         }
-        match self.inner.take() {
-            Some(w) => {
-                w.close()?;
-            }
+        let file_meta = match self.inner.take() {
+            Some(w) => w.close()?,
             // Nothing was ever written: still produce a real, stamped, empty artifact rather than
-            // leaving a consumer to trip over a missing file.
+            // leaving a consumer to trip over a missing file. Its manifest records zero row groups,
+            // which is a verifiable claim — "this artifact is empty" — not an absence of one.
             None => {
                 let schema = stamped_schema(&self.spec.schema, &self.kv);
+                self.coverage = integrity::Coverage::of_schema(&self.spec.schema);
                 let file = File::create(&self.path)?;
-                ArrowWriter::try_new(file, schema, Some(writer_properties()))?.close()?;
+                ArrowWriter::try_new(file, schema, Some(writer_properties()))?.close()?
             }
-        }
+        };
+
+        integrity::check_layout(&self.path, &self.groups, &file_meta)?;
+        integrity::write_manifest(
+            &self.path,
+            &self.spec,
+            &self.table,
+            &self.producer,
+            self.rows,
+            std::mem::take(&mut self.coverage),
+            std::mem::take(&mut self.groups),
+        )?;
         Ok(())
     }
 
@@ -522,10 +597,19 @@ impl Writer {
             let file = File::create(&self.path)?;
             self.inner = Some(ArrowWriter::try_new(file, schema.clone(), Some(writer_properties()))?);
             self.file_schema = Some(schema);
+            // Coverage is a property of the schema, and every batch shares one, so it is settled
+            // once — by the batch that fixes the file's schema.
+            self.coverage = integrity::Coverage::of(batch);
         }
         // Re-stamp so the batch carries exactly the schema the file declares (as `write_with` does).
         let schema = self.file_schema.clone().unwrap();
         let batch = RecordBatch::try_new(schema, batch.columns().to_vec())?;
+
+        // THE GATE, on the streaming path. `emit` is handed whole row groups, but possibly several
+        // at once (the fast path passes through any multiple of ROW_GROUP_ROWS), so the digests are
+        // taken per row group — matching the cuts the writer is about to make, not the call.
+        self.groups.extend(integrity::digest_batch(&batch, self.groups.len()));
+
         self.inner.as_mut().unwrap().write(&batch)?;
         Ok(())
     }

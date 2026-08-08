@@ -1,6 +1,6 @@
 [package]
 name = "timsim-schema"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 rust-version = "1.84"
 license = "MIT"
@@ -11,7 +11,20 @@ description = "The schema contract for timsim v2: one definition of every column
 arrow = "56"
 parquet = "56"
 thiserror = "2"
+# The integrity gate. SHA-256 is a *standard*, not an implementation detail: bumping this
+# dependency cannot change an artifact's recorded hash, which is exactly what makes a sidecar
+# comparable across machines and across years.
+sha2 = "0.10"
+# The sidecar manifest is meant to be read by a human at 2am, so it is JSON, not a binary blob.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"
 parquet = "56"
+
+# The independent re-read half of the integrity gate. A NEW binary — no existing binary's flags
+# are touched.
+[[bin]]
+name = "timsim-verify"
+path = "src/bin/timsim_verify.rs"
